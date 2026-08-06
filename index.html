@@ -1,0 +1,652 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Sauce Bottle Throw — physics sim</title>
+<style>
+  * { box-sizing: border-box; }
+  html,body { margin:0; height:100%; background:#eef1f5; color:#2a3038;
+              font:12px/1.4 system-ui,sans-serif; overflow:hidden; }
+  #panel { position:fixed; left:0; top:0; bottom:0; width:250px; padding:10px 12px;
+           overflow-y:auto; background:#f7f9fc; border-right:1px solid #d5dbe4; }
+  #panel h1 { font-size:14px; margin:0 0 8px; letter-spacing:.5px; }
+  #panel h2 { font-size:10px; text-transform:uppercase; letter-spacing:1px;
+              color:#7a8494; margin:14px 0 4px; border-top:1px solid #d5dbe4; padding-top:8px; }
+  label { display:block; margin:6px 0; }
+  label span { float:right; color:#1a6ed8; font-variant-numeric:tabular-nums; }
+  input[type=range] { width:100%; margin:2px 0 0; accent-color:#d0432a; }
+  select { width:100%; background:#fff; color:#2a3038; border:1px solid #c9d1dc; padding:3px; }
+  .row { display:flex; gap:6px; margin-top:8px; }
+  button { flex:1; padding:7px 4px; background:#d0432a; color:#fff; border:0;
+           border-radius:3px; cursor:pointer; font:600 12px system-ui; }
+  button.alt { background:#e4e9f0; color:#2a3038; }
+  .chk { display:flex; align-items:center; gap:6px; margin:6px 0; }
+  #transport { position:sticky; bottom:-10px; background:#f7f9fc; padding:6px 0 10px;
+               border-top:1px solid #d5dbe4; margin-top:12px; }
+  #time { accent-color:#1a6ed8; }
+  #hud { position:fixed; right:10px; top:10px; text-align:right; color:#5b6676; z-index:2;
+         font-variant-numeric:tabular-nums; pointer-events:none; text-shadow:0 1px 3px #fff; }
+  #hud b { color:#161b22; font-weight:600; }
+  canvas { position:fixed; left:250px; top:0; }
+</style>
+</head>
+<body>
+<div id="panel">
+  <h1>🍅 Sauce Bottle Throw</h1>
+
+  <h2>Bottle &amp; contents</h2>
+  <label>Shape
+    <select id="shape">
+      <option value="squeeze">Squeeze bottle</option>
+      <option value="jar">Squat jar</option>
+      <option value="hot">Hot-sauce (tapered)</option>
+      <option value="flask">Round-bellied flask</option>
+    </select>
+  </label>
+  <label>Fill <span id="v_fill"></span><input type="range" id="fill" min="0" max="100" value="50" data-u="%"></label>
+  <label>Viscosity <span id="v_visc"></span><input type="range" id="visc" min="0" max="100" value="80" data-u="%"></label>
+  <label>Bottle mass <span id="v_mass"></span><input type="range" id="mass" min="15" max="400" value="60" data-u=" g"></label>
+  <label>Wall flex <span id="v_flex"></span><input type="range" id="flex" min="0" max="100" value="0" data-u="%"></label>
+  <div class="chk"><input type="checkbox" id="cap" checked><label for="cap" style="margin:0">Cap on (uncheck to spill)</label></div>
+
+  <h2>Throw</h2>
+  <label>Speed <span id="v_spd"></span><input type="range" id="spd" min="0" max="30" value="11" step="0.5" data-u=" m/s"></label>
+  <label>Angle <span id="v_ang"></span><input type="range" id="ang" min="-30" max="90" value="42" data-u="°"></label>
+  <label>Release height <span id="v_hgt"></span><input type="range" id="hgt" min="0.1" max="50" value="15" step="0.1" data-u=" m"></label>
+  <label>Spin <span id="v_spin"></span><input type="range" id="spin" min="-30" max="30" value="0" step="0.5" data-u=" rad/s"></label>
+  <label>Initial tilt <span id="v_tilt"></span><input type="range" id="tilt" min="-180" max="180" value="90" step="5" data-u="°"></label>
+
+  <h2>World</h2>
+  <label>Gravity <span id="v_grav"></span><input type="range" id="grav" min="0.5" max="25" value="9.81" step="0.01" data-u=" m/s²"></label>
+  <label>Ground bounce <span id="v_rest"></span><input type="range" id="rest" min="0" max="80" value="30" data-u="%"></label>
+  <label>Ground friction <span id="v_fric"></span><input type="range" id="fric" min="0" max="100" value="55" data-u="%"></label>
+  <label>Air drag (Cd) <span id="v_drag"></span><input type="range" id="drag" min="0" max="250" value="100" data-u="%"></label>
+
+  <h2>View</h2>
+  <label>Sim speed <span id="v_slow"></span><input type="range" id="slow" min="2" max="100" value="100" data-u="%"></label>
+  <label>Zoom <span id="v_zoom"></span><input type="range" id="zoom" min="1" max="40" value="2" step="0.1" data-u="×"></label>
+  <div class="chk"><input type="checkbox" id="trail" checked><label for="trail" style="margin:0">Show trail</label></div>
+
+  <div id="transport">
+    <label>Timeline ← → <span id="v_time"></span><input type="range" id="time" min="0" max="0" value="0"></label>
+    <div class="row"><button id="throw">Throw ⏎</button><button id="pause" class="alt">Pause</button></div>
+    <div class="row"><button id="reset" class="alt">Reset</button></div>
+  </div>
+</div>
+<div id="hud"></div>
+<canvas id="c"></canvas>
+
+<script>
+const $ = id => document.getElementById(id);
+const V = id => +$(id).value;
+const clamp = (x,a,b) => x<a?a:x>b?b:x;
+
+/* ---------- bottle shapes: right-hand profile, base->mouth, metres ---------- */
+const SHAPES = {
+  squeeze: [[.030,0],[.036,.020],[.036,.130],[.030,.158],[.013,.185],[.013,.215]],
+  jar:     [[.045,0],[.050,.015],[.050,.090],[.044,.108],[.022,.126],[.022,.142]],
+  hot:     [[.028,0],[.030,.012],[.024,.150],[.011,.176],[.011,.202]],
+  flask:   [[.020,0],[.045,.030],[.052,.072],[.045,.112],[.028,.144],[.012,.168],[.012,.196]],
+};
+
+let PX=[], PY=[], PN=0, MOUTH_EDGE=0, AREA=0, IB_UNIT=0;
+function buildShape(key){
+  const prof = SHAPES[key];
+  const pts = prof.map(p=>[p[0],p[1]]);
+  for (let i=prof.length-1;i>=0;i--) pts.push([-prof[i][0], prof[i][1]]);
+  MOUTH_EDGE = prof.length-1;
+  // shoelace area + centroid, then recentre on the centroid
+  let a=0,cx=0,cy=0;
+  for (let i=0;i<pts.length;i++){
+    const j=(i+1)%pts.length, cr = pts[i][0]*pts[j][1]-pts[j][0]*pts[i][1];
+    a += cr; cx += (pts[i][0]+pts[j][0])*cr; cy += (pts[i][1]+pts[j][1])*cr;
+  }
+  a/=2; cx/=6*a; cy/=6*a;
+  PX = pts.map(p=>p[0]-cx); PY = pts.map(p=>p[1]-cy); PN = pts.length;
+  AREA = Math.abs(a);
+  const w = 2*Math.max(...PX), h = Math.max(...PY)-Math.min(...PY);
+  IB_UNIT = (w*w+h*h)/12;          // per kg, thin-box approximation
+  RESTLEN = PX.map((_,i)=>{ const j=(i+1)%PN;
+    return Math.hypot(PX[j]-PX[i], PY[j]-PY[i]); });
+  shellReset();
+}
+
+// PX/PY are the rest shape; DX/DY are where the wall actually is right now. Everything that
+// touches the bottle — liquid containment, ground contact, drawing — reads DX/DY, so a glass
+// bottle (flex 0, DX===PX every step) behaves exactly as before and a plastic one deforms.
+let DX=[], DY=[], DVX=[], DVY=[], RESTLEN=[];
+function shellReset(){
+  DX=PX.slice(); DY=PY.slice();
+  DVX=new Array(PN).fill(0); DVY=new Array(PN).fill(0);
+}
+
+// Position-based dynamics, same family as the liquid solver: edge lengths are held hard
+// (plastic bends, it doesn't stretch) while a soft pull toward the rest shape provides the
+// springback. Stiffness is a 0..1 blend rather than a spring constant, so there is no
+// stiffness/timestep stability limit to tune — a real PET wall is far too stiff to integrate
+// explicitly at 240 Hz.
+function shellStep(dt, flex){
+  if (flex<=0) return;
+  const damp=1-2.5*dt, sShape=0.06+0.5*(1-flex);
+  const px=DX.slice(), py=DY.slice();
+  for (let i=0;i<PN;i++){
+    DVX[i]*=damp; DVY[i]*=damp;
+    DX[i]+=DVX[i]*dt; DY[i]+=DVY[i]*dt;
+  }
+  for (let it=0; it<2; it++){
+    for (let i=0;i<PN;i++){
+      const j=(i+1)%PN, dx=DX[j]-DX[i], dy=DY[j]-DY[i], d=Math.hypot(dx,dy)||1e-9;
+      const corr=(d-RESTLEN[i])/d*0.5;
+      DX[i]+=dx*corr; DY[i]+=dy*corr; DX[j]-=dx*corr; DY[j]-=dy*corr;
+    }
+    for (let i=0;i<PN;i++){
+      DX[i]+=(PX[i]-DX[i])*sShape; DY[i]+=(PY[i]-DY[i])*sShape;
+    }
+  }
+  // hard cap on how far the wall can ever move from its rest position — a backstop so a bad
+  // coupling gain can only ever look wrong, not explode
+  const maxDent=0.5*Math.hypot(...[Math.max(...PX)-Math.min(...PX), Math.max(...PY)-Math.min(...PY)])/2;
+  for (let i=0;i<PN;i++){
+    const ex=DX[i]-PX[i], ey=DY[i]-PY[i], d=Math.hypot(ex,ey);
+    if (d>maxDent){ DX[i]=PX[i]+ex/d*maxDent; DY[i]=PY[i]+ey/d*maxDent; }
+    DVX[i]=clamp((DX[i]-px[i])/dt,-20,20);
+    DVY[i]=clamp((DY[i]-py[i])/dt,-20,20);
+  }
+}
+
+function inside(x,y){
+  let c=false;
+  for (let i=0,j=PN-1;i<PN;j=i++)
+    if ((DY[i]>y)!==(DY[j]>y) && x < (DX[j]-DX[i])*(y-DY[i])/(DY[j]-DY[i])+DX[i]) c=!c;
+  return c;
+}
+
+/* ---------- state ---------- */
+let liq=[], spill=[], trailPts=[];
+let spacing=.006, HR=.012, RHO0=1, MASS_L=0, MASS_B=.06, INER=1;
+let c={x:0,y:1.6}, vc={x:0,y:0}, th=0, om=0;   // c = combined centre of mass
+let O={x:0,y:0}, comLx=0, comLy=0, vOx=0, vOy=0, aOf={x:0,y:0,a:0};
+let launched=false, paused=false, sleepT=0, comLock=null;
+const lam=new Float64Array(32), lamT=new Float64Array(32);  // accumulated contact impulses,
+                                                            // indexed by bottle vertex
+let stats={apex:0,dist:0,hit:0,spilled:0};
+
+const DT = 1/240;
+// Pressure stiffness and liquid sub-steps. Swept empirically: one liquid step per physics
+// step boils at any usable stiffness (displacement per step exceeded the particle spacing),
+// and simply lowering the stiffness let gravity crush the column instead. 3 sub-steps holds
+// both — settles dead still, and the settled density matches the seeded packing to ~5%.
+const KP=60, KNP=300, LSUB=3;
+const DEPTH = 0.055;   // notional bottle depth — this is a 2D sim, so mass and frontal area need one
+
+function seedLiquid(fillFrac){
+  const xs=Math.min(...PX), xe=Math.max(...PX), ys=Math.min(...PY), ye=Math.max(...PY);
+  spacing = Math.sqrt(AREA/420);
+  HR = 2.0*spacing;
+  const cand=[];
+  const dy = spacing*0.866;
+  for (let y=ys+spacing*0.6, row=0; y<ye; y+=dy, row++)
+    for (let x=xs+spacing*0.6+(row%2?spacing/2:0); x<xe; x+=spacing)
+      if (inside(x,y) && inside(x+spacing*.4,y) && inside(x-spacing*.4,y)) cand.push([x,y]);
+  cand.sort((a,b)=>a[1]-b[1]);
+  const n = Math.round(cand.length*fillFrac);
+  liq = cand.slice(0,n).map(p=>({x:p[0],y:p[1],px:p[0],py:p[1],vx:0,vy:0,rho:0,rn:0}));
+  // rest density measured from the actual packing — no magic constant to tune
+  RHO0 = 1;
+  if (liq.length>8){ grid(); let s=0,k=0;
+    for (const p of liq){ let r=0; forNeighbours(p,(q,dx,dy,d)=>{ r+=(1-d/HR)**2; });
+      if (p.y < ys+(ye-ys)*0.5){ s+=r; k++; } }
+    RHO0 = k? s/k : 3;
+  }
+  MASS_L = AREA*fillFrac*DEPTH*1000;   // water-ish density
+  spill=[];
+}
+
+/* ---------- neighbour grid ---------- */
+let cells=new Map();
+function grid(){
+  cells.clear();
+  for (const p of liq){
+    const k = (Math.floor(p.x/HR)+512)*4096 + (Math.floor(p.y/HR)+512);
+    let a=cells.get(k); if(!a) cells.set(k,a=[]); a.push(p);
+  }
+}
+function forNeighbours(p,fn){
+  const ix=Math.floor(p.x/HR), iy=Math.floor(p.y/HR);
+  for (let a=-1;a<=1;a++) for (let b=-1;b<=1;b++){
+    const arr=cells.get((ix+a+512)*4096 + (iy+b+512)); if(!arr) continue;
+    for (const q of arr){
+      if (q===p) continue;
+      const dx=q.x-p.x, dy=q.y-p.y, d=Math.hypot(dx,dy);
+      if (d>0 && d<HR) fn(q,dx,dy,d);
+    }
+  }
+}
+
+/* ---------- liquid (Clavet et al. 2005, position-based) ---------- */
+function liquidStep(dt, ax, ay, alpha, visc){
+  const sigma = 6+visc*90, beta = 2+visc*60;
+  for (const p of liq){
+    p.vx += (ax + om*om*p.x + alpha*p.y + 2*om*p.vy)*dt;   // gravity + centrifugal + Euler + Coriolis
+    p.vy += (ay + om*om*p.y - alpha*p.x - 2*om*p.vx)*dt;
+  }
+  grid();
+  for (const p of liq) forNeighbours(p,(q,dx,dy,d)=>{
+    if (q.x<p.x || (q.x===p.x && q.y<p.y)) return;              // each pair once
+    const ux=dx/d, uy=dy/d, u=(p.vx-q.vx)*ux+(p.vy-q.vy)*uy;
+    if (u<=0) return;
+    let I = clamp(dt*(1-d/HR)*(sigma*u+beta*u*u), 0, u)*0.5;
+    p.vx-=I*ux; p.vy-=I*uy; q.vx+=I*ux; q.vy+=I*uy;
+  });
+  for (const p of liq){ p.px=p.x; p.py=p.y; p.x+=p.vx*dt; p.y+=p.vy*dt; }
+  grid();
+  const k=KP, kn=KNP, lim=0.4*HR;
+  for (const p of liq){ p.rho=0; p.rn=0;
+    forNeighbours(p,(q,dx,dy,d)=>{ const t=1-d/HR; p.rho+=t*t; p.rn+=t*t*t; }); }
+  for (const p of liq){
+    const P=k*(p.rho-RHO0), Pn=kn*p.rn;
+    let sx=0, sy=0;
+    forNeighbours(p,(q,dx,dy,d)=>{
+      const t=1-d/HR, D=clamp(dt*dt*(P*t+Pn*t*t),-lim,lim)*0.5, ux=dx/d, uy=dy/d;
+      q.x+=D*ux; q.y+=D*uy; sx-=D*ux; sy-=D*uy;
+    });
+    p.x+=sx; p.y+=sy;
+  }
+  // walls / escape / adhesion
+  const capOn=$('cap').checked, fr=0.15+0.6*visc, cth=Math.cos(th), sth=Math.sin(th);
+  const adh=visc*0.85, adhR=spacing*1.1;   // sauce clings to the glass; water barely does
+  const flexNow=V('flex')/100;
+  let wallCount=0;
+  for (let i=liq.length-1;i>=0;i--){
+    const p=liq[i];
+    const out=!inside(p.x,p.y);
+    let best=1e9,bx=0,by=0,bi=-1,bt=0;
+    for (let e=0;e<PN;e++){
+      const j=(e+1)%PN, ax2=DX[e], ay2=DY[e], ex=DX[j]-ax2, ey=DY[j]-ay2;
+      let t=((p.x-ax2)*ex+(p.y-ay2)*ey)/(ex*ex+ey*ey); t=clamp(t,0,1);
+      const qx=ax2+t*ex, qy=ay2+t*ey, dd=(p.x-qx)**2+(p.y-qy)**2;
+      if (dd<best){ best=dd; bx=qx; by=qy; bi=e; bt=t; }
+    }
+    if (out){
+      if (!capOn && bi===MOUTH_EDGE){                 // out of the neck
+        liq.splice(i,1); stats.spilled++;
+        const vx=(p.x-p.px)/dt, vy=(p.y-p.py)/dt;
+        if (spill.length<900) spill.push({
+          x:O.x+cth*p.x-sth*p.y, y:O.y+sth*p.x+cth*p.y,
+          vx:vOx+cth*vx-sth*vy-om*(sth*p.x+cth*p.y),
+          vy:vOy+sth*vx+cth*vy+om*(cth*p.x-sth*p.y)});
+        continue;
+      }
+      // ponytail: no reaction force back onto the wall. Tried it; every wall particle nudging
+      // its edge outward every sub-step inflated the bottle and pinned it there. The coupling
+      // that matters is one-way anyway — the wall caves in, the containment carries the sauce
+      // with it, and the sauce leaves through the neck.
+      p.x=bx; p.y=by;
+      p.px += fr*(p.x-p.px); p.py += fr*(p.y-p.py);   // ponytail: crude no-slip, scales with viscosity
+    } else if (adh>0 && best < adhR*adhR){
+      wallCount++;
+      // adhesion: drag the wall layer toward rest in the bottle's frame. This is what actually
+      // holds thick sauce up in an upturned bottle — internal stiffness alone just falls out.
+      p.px += adh*(p.x-p.px); p.py += adh*(p.y-p.py);
+    }
+  }
+  for (const p of liq){
+    p.vx=clamp((p.x-p.px)/dt,-40,40);
+    p.vy=clamp((p.y-p.py)/dt,-40,40);
+  }
+  // Yield stress. Viscous damping alone can only ever make the sauce flow *slowly* — thick
+  // honey still drains out of an upturned bottle. Real sauce holds its shape until something
+  // stresses it enough. Cheap stand-in: blend the slug's velocities toward the rigid-body
+  // motion of the whole mass (mean velocity + the rotation matching its angular momentum).
+  // At full blend the sauce cannot deform at all and rides in the bottle as a solid plug.
+  // ponytail: global, so two separated blobs would rigidly couple. Per-blob would need
+  // connected-component labelling — do that if anyone cares about a split slug.
+  const rig = Math.max(0, (visc-0.45)/0.55)**2;
+  if (rig>0 && liq.length>2){
+    let cx=0, cy=0, vx=0, vy=0;
+    for (const p of liq){ cx+=p.x; cy+=p.y; vx+=p.vx; vy+=p.vy; }
+    const n=liq.length; cx/=n; cy/=n; vx/=n; vy/=n;
+    let L=0, I=0;
+    for (const p of liq){ const rx=p.x-cx, ry=p.y-cy;
+      L += rx*(p.vy-vy) - ry*(p.vx-vx); I += rx*rx+ry*ry; }
+    let w = I>1e-9 ? L/I : 0;
+    // The yield criterion. Stuck to the glass and stressed below yield, the slug does not move
+    // at all — that is what separates sauce from merely thick liquid, and gravity alone (0.014
+    // m/s per sub-step) never reaches it. An impact does, so a good whack still shifts it.
+    const yieldV = visc*0.35;
+    if (wallCount>0 && Math.hypot(vx,vy) < yieldV && Math.abs(w)*0.05 < yieldV){ vx=0; vy=0; w=0; }
+    for (const p of liq){ const rx=p.x-cx, ry=p.y-cy;
+      p.vx += rig*((vx - w*ry) - p.vx);
+      p.vy += rig*((vy + w*rx) - p.vy); }
+  }
+}
+
+/* ---------- rigid bottle ---------- */
+function comLocal(){
+  let lx=0, ly=0;
+  if (liq.length){ for (const p of liq){ lx+=p.x; ly+=p.y; } lx/=liq.length; ly/=liq.length; }
+  const M=MASS_B+MASS_L;
+  comLx = MASS_L*lx/M; comLy = MASS_L*ly/M;
+  INER = MASS_B*(IB_UNIT + comLx*comLx+comLy*comLy)
+       + MASS_L*((lx-comLx)**2+(ly-comLy)**2) + 1e-5;
+  return [lx,ly];
+}
+
+function step(dt){
+  const g=V('grav'), visc=V('visc')/100, flex=V('flex')/100;
+  comLocal();
+  if (comLock){ comLx=comLock.x; comLy=comLock.y; }   // asleep: liquid drift must not walk the bottle
+  let touching=false;
+  const cth=Math.cos(th), sth=Math.sin(th);
+  O.x = c.x - (cth*comLx - sth*comLy);
+  O.y = c.y - (sth*comLx + cth*comLy);
+  const rx=O.x-c.x, ry=O.y-c.y;
+  const vOx0 = vc.x - om*ry, vOy0 = vc.y + om*rx, om0 = om;
+
+  if (launched){
+    const M=MASS_B+MASS_L;
+    vc.y -= g*dt;
+    // Air drag on the silhouette presented to the airflow, acting at the centre of
+    // pressure (≈ the polygon centroid, i.e. O). Weight acts at c, so once the liquid
+    // shifts the CoM off-centre the drag force also torques the bottle.
+    const cdm=V('drag')/100, s=Math.hypot(vc.x,vc.y);
+    if (cdm>0 && s>0.05){
+      const ux=vc.x/s, uy=vc.y/s, ct0=Math.cos(th), st0=Math.sin(th);
+      let lo=1e9, hi=-1e9;
+      for (let i=0;i<PN;i++){                       // extent across the flow direction
+        const w = -(ct0*DX[i]-st0*DY[i])*uy + (st0*DX[i]+ct0*DY[i])*ux;
+        if (w<lo) lo=w; if (w>hi) hi=w;
+      }
+      const A=(hi-lo)*DEPTH, F=0.5*1.2*0.8*cdm*A*s*s;
+      const dv=Math.min(F/M*dt, s*0.5);             // never let one step reverse the flight
+      vc.x -= dv*ux; vc.y -= dv*uy;
+      const rx=O.x-c.x, ry=O.y-c.y;
+      om += (ry*ux - rx*uy)*(dv*M)/INER;            // r × F about the centre of mass
+      om -= 0.25*1.2*0.8*cdm*DEPTH*0.11**4*om*Math.abs(om)/INER*dt;   // spin bleed-off
+    }
+    c.x += vc.x*dt; c.y += vc.y*dt; th += om*dt;
+
+    // ground contacts, impulse per penetrating vertex
+    const e=V('rest')/100, mu=V('fric')/100;
+    const ct=Math.cos(th), st=Math.sin(th);
+    // Sequential impulse with accumulated, warm-started multipliers (Catto/Box2D style).
+    // Contact geometry is fixed for the whole velocity solve; each iteration clamps the
+    // RUNNING total to be non-tensile rather than clamping its own increment, so a later
+    // iteration can walk back an earlier over-correction. That is what makes two vertices
+    // resting on the ground converge instead of chasing each other. Vertex index is a stable
+    // contact id across frames, so last step's impulse is a free initial guess.
+    const cts=[];
+    let deepest=0;
+    for (let i=0;i<PN;i++){
+      const wx=O.x+ct*DX[i]-st*DY[i], wy=O.y+st*DX[i]+ct*DY[i];
+      if (wy>=0){ lam[i]=0; lamT[i]=0; continue; }
+      deepest=Math.min(deepest,wy); touching=true;
+      const rx=wx-c.x, ry=wy-c.y, vn0=vc.y+om*rx;
+      if (vn0<0 && !stats.hit) stats.hit=Math.hypot(vc.x,vc.y);
+      // restitution enters once, as a target velocity, and only above a threshold closing
+      // speed — the small moment of inertia turns a 0.1 m/s corner tap into ~1 rad/s of spin
+      // a flexing wall eats energy on the way in that it never gives back — hysteresis
+      const eW = e*(1-0.6*flex);
+      // compliance (XPBD-style): a flexing wall cannot stop the body inside one step, so
+      // soften the normal constraint and let the collision spread over several
+      cts.push({i, rx, ry, vn0, mn:1/M+rx*rx/INER + flex*1.2e-4/(dt*dt),
+                mt:1/M+ry*ry/INER, bias: vn0<-0.4 ? -eW*vn0 : 0});
+    }
+    for (const k of cts){                                  // warm start
+      vc.y += lam[k.i]/M;  om += k.rx*lam[k.i]/INER;
+      vc.x += lamT[k.i]/M; om += -k.ry*lamT[k.i]/INER;
+    }
+    for (let it=0; it<2; it++) for (const k of cts){
+      const i=k.i;
+      let d = (k.bias - (vc.y+om*k.rx))/k.mn;
+      const nl = Math.max(0, lam[i]+d); d = nl-lam[i]; lam[i] = nl;
+      vc.y += d/M; om += k.rx*d/INER;
+      let dt2 = -(vc.x-om*k.ry)/k.mt;
+      const nt = clamp(lamT[i]+dt2, -mu*lam[i], mu*lam[i]); dt2 = nt-lamT[i]; lamT[i] = nt;
+      vc.x += dt2/M; om += -k.ry*dt2/INER;
+    }
+    const slop=0.0002;                        // leave a little penetration alone; correcting
+    if (deepest<-slop){                       // it every step pumps energy into the contact
+      const corr=(deepest+slop)*0.8; c.y -= corr; O.y -= corr;
+    }
+    // A plastic wall doesn't just transmit the contact impulse to the body, it caves in under
+    // it. Drive the dent from the closing SPEED, not impulse/vertex-mass: the body is brought
+    // to a stop by the contact while the wall carries on for a moment at up to the impact
+    // speed. (Impulse over one vertex's share of the mass is meaningless — it gave metre-deep
+    // dents on a 215 mm bottle.)
+    if (flex>0){
+      const nlx=st, nly=ct;                   // world "up" expressed in the bottle frame
+      for (const k of cts){
+        const s2=0.6*flex*Math.max(0,-k.vn0);
+        DVX[k.i] += nlx*s2; DVY[k.i] += nly*s2;
+      }
+    }
+    // Sleep. The contact solver now converges to exactly zero residual spin, so this is here
+    // purely for the other drift channel: the bottle is drawn at O = c - R*comL, so sub-mm
+    // wander in the settled liquid's centroid still walks the body at ~1 mm/s. Latching also
+    // freezes comL (below) to close that off. The real fix is to integrate the bottle body as
+    // primary state and derive c from it — worth it only if this ever needs to not sleep.
+    sleepT = (touching && Math.hypot(vc.x,vc.y)<0.06 && Math.abs(om)<1) ? sleepT+dt : 0;
+    if (sleepT>0.4){ vc.x=0; vc.y=0; om=0; comLock=comLock||{x:comLx,y:comLy}; }
+    else comLock=null;
+  }
+
+  // recompute origin after collisions, then the frame's acceleration
+  const ct2=Math.cos(th), st2=Math.sin(th);
+  O.x = c.x - (ct2*comLx - st2*comLy);
+  O.y = c.y - (st2*comLx + ct2*comLy);
+  const rx2=O.x-c.x, ry2=O.y-c.y;
+  vOx = vc.x - om*ry2; vOy = vc.y + om*rx2;
+  // Contact impulses land in a single step, and feeding that raw spike to the liquid made
+  // a resting bottle shake itself along the ground forever (liquid jitter -> CoM jitter ->
+  // fresh contact impulse). Smoothing over ~8 steps breaks the loop; a real impact isn't
+  // instantaneous anyway.
+  aOf.x += 0.35*((vOx-vOx0)/dt - aOf.x);
+  aOf.y += 0.35*((vOy-vOy0)/dt - aOf.y);
+  aOf.a += 0.35*((om-om0)/dt - aOf.a);
+  const aOx=aOf.x, aOy=aOf.y, alpha=aOf.a;
+  // fictitious gravity in the bottle frame: free fall cancels it, impacts spike it
+  const dx=0-aOx, dy=-g-aOy;
+  shellStep(dt, flex);
+  const lax=ct2*dx+st2*dy, lay=-st2*dx+ct2*dy;
+  for (let i=0;i<LSUB;i++) liquidStep(dt/LSUB, lax, lay, alpha, visc);
+
+  for (const s of spill){
+    s.vy -= g*dt; s.x += s.vx*dt; s.y += s.vy*dt;
+    if (s.y < 0.002){ s.y=0.002; s.vy*=-0.15; s.vx*=0.75-0.5*visc; }
+  }
+  if (launched){
+    stats.apex = Math.max(stats.apex, O.y);
+    stats.dist = O.x;
+    if (trailPts.length<4000 && $('trail').checked) trailPts.push(c.x,c.y);
+  }
+}
+
+/* ---------- rewind tape: one keyframe per rendered frame ---------- */
+// ponytail: raw snapshots, ~4 KB each, capped at 1800 frames (~7 MB). Delta-compress if
+// somebody wants a longer recording than that.
+let tape=[], simT=0;
+function snap(){
+  const a=new Float32Array(liq.length*4), s=new Float32Array(spill.length*4);
+  for (let i=0;i<liq.length;i++){ const p=liq[i];
+    a[i*4]=p.x; a[i*4+1]=p.y; a[i*4+2]=p.vx; a[i*4+3]=p.vy; }
+  for (let i=0;i<spill.length;i++){ const q=spill[i];
+    s[i*4]=q.x; s[i*4+1]=q.y; s[i*4+2]=q.vx; s[i*4+3]=q.vy; }
+  return {t:simT, cx:c.x, cy:c.y, vx:vc.x, vy:vc.y, th, om, a, s, st:{...stats}, tl:trailPts.length};
+}
+function restore(k){
+  if (!k) return;
+  simT=k.t; c.x=k.cx; c.y=k.cy; vc.x=k.vx; vc.y=k.vy; th=k.th; om=k.om; stats={...k.st};
+  liq.length=k.a.length/4;
+  for (let i=0;i<liq.length;i++){ const p=liq[i]||(liq[i]={});
+    p.x=p.px=k.a[i*4]; p.y=p.py=k.a[i*4+1]; p.vx=k.a[i*4+2]; p.vy=k.a[i*4+3]; p.rho=0; p.rn=0; }
+  spill.length=k.s.length/4;
+  for (let i=0;i<spill.length;i++){ const q=spill[i]||(spill[i]={});
+    q.x=k.s[i*4]; q.y=k.s[i*4+1]; q.vx=k.s[i*4+2]; q.vy=k.s[i*4+3]; }
+  trailPts.length=k.tl;
+  comLocal();
+  O.x = c.x-(Math.cos(th)*comLx-Math.sin(th)*comLy);
+  O.y = c.y-(Math.sin(th)*comLx+Math.cos(th)*comLy);
+}
+function seek(i){
+  i=clamp(Math.round(i),0,tape.length-1);
+  $('time').value=i; restore(tape[i]);
+  if (!paused) $('pause').click();
+}
+
+/* ---------- setup / controls ---------- */
+function rebuild(){
+  buildShape($('shape').value);
+  seedLiquid(V('fill')/100);
+  reset();
+}
+// Move the bottle back to the release point WITHOUT disturbing the liquid — re-seeding here
+// made the settled sauce visibly snap back to its starting lattice on every throw.
+function place(){
+  launched=false; th=V('tilt')*Math.PI/180; om=0; aOf={x:0,y:0,a:0}; sleepT=0; comLock=null;
+  vc={x:0,y:0}; trailPts=[]; tape=[]; simT=0; lam.fill(0); lamT.fill(0); shellReset();
+  stats={apex:0,dist:0,hit:0,spilled:0};
+  MASS_B = V('mass')/1000;
+  comLocal();
+  const h=V('hgt'), ct=Math.cos(th), st=Math.sin(th);
+  c.x = ct*comLx - st*comLy; c.y = h + (st*comLx + ct*comLy);
+  O={x:0,y:h};
+}
+function reset(){ seedLiquid(V('fill')/100); spill=[]; place(); }
+function launch(){
+  if (spill.length) reset();   // sauce went overboard last time — start with a full bottle
+  else place();
+  const a=V('ang')*Math.PI/180, s=V('spd');
+  vc={x:Math.cos(a)*s, y:Math.sin(a)*s}; om=V('spin');
+  launched=true;
+}
+
+document.querySelectorAll('input[type=range]:not(#time)').forEach(el=>{
+  const out=$('v_'+el.id), u=el.dataset.u||'';
+  const upd=()=>out.textContent=(+el.value).toFixed(el.step&&el.step<1?2:0)+u;
+  el.addEventListener('input',upd); upd();
+});
+['shape','fill'].forEach(id=>$(id).addEventListener('input',rebuild));
+['mass','hgt','tilt'].forEach(id=>$(id).addEventListener('input',()=>{ if(!launched) place(); }));
+$('time').addEventListener('input',()=>seek(V('time')));
+$('throw').onclick=launch;
+$('reset').onclick=reset;
+$('pause').onclick=()=>{
+  paused=!paused; $('pause').textContent=paused?'Resume':'Pause';
+  if (!paused) tape.length=clamp(V('time')+1,1,tape.length);   // resuming rewrites the future
+};
+addEventListener('keydown',e=>{
+  if(e.key==='Enter') launch();
+  if(e.key===' '){ e.preventDefault(); $('pause').click(); }
+  if(e.key==='ArrowLeft'){ e.preventDefault(); seek(V('time')-(e.shiftKey?10:1)); }
+  if(e.key==='ArrowRight'){ e.preventDefault(); seek(V('time')+(e.shiftKey?10:1)); }
+});
+
+/* ---------- render ---------- */
+const cvs=$('c'), ctx=cvs.getContext('2d');
+let W=0,H=0;
+function resize(){
+  W=innerWidth-250; H=innerHeight;
+  cvs.style.width=W+'px'; cvs.style.height=H+'px';
+  cvs.width=W*devicePixelRatio; cvs.height=H*devicePixelRatio;
+  ctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0);
+}
+addEventListener('resize',resize); resize();
+
+function draw(){
+  const zoom=V('zoom'), viewW=8/zoom, sc=W/viewW, viewH=H/sc;
+  // follow the bottle, but never pan the ground off the bottom edge
+  const camx=O.x, camy=Math.max(O.y, viewH*0.5-0.35);
+  const sx=x=>(x-camx)*sc+W/2, sy=y=>H/2-(y-camy)*sc;
+
+  const sky=ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0,'#cddff0'); sky.addColorStop(1,'#eef4fa');
+  ctx.fillStyle=sky; ctx.fillRect(0,0,W,H);
+
+  // ground + metre marks
+  const gy=sy(0);
+  ctx.fillStyle='#d9e0cd'; ctx.fillRect(0,gy,W,H-gy);
+  ctx.strokeStyle='#95a383'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(0,gy); ctx.lineTo(W,gy); ctx.stroke();
+  const stepM = viewW>4?1:viewW>1?0.2:viewW>0.4?0.05:0.01;
+  ctx.fillStyle='#7d8a6c'; ctx.font='10px system-ui';
+  for (let x=Math.floor((camx-viewW/2)/stepM)*stepM; x<camx+viewW/2; x+=stepM){
+    const px=sx(x); ctx.fillRect(px,gy,1,6);
+    if (viewW<2 || Math.abs(x%1)<1e-6) ctx.fillText(x.toFixed(stepM<1?2:0)+'m',px+3,gy+14);
+  }
+
+  if ($('trail').checked && trailPts.length>3){
+    ctx.strokeStyle='rgba(190,60,40,.40)'; ctx.beginPath();
+    ctx.moveTo(sx(trailPts[0]),sy(trailPts[1]));
+    for (let i=2;i<trailPts.length;i+=2) ctx.lineTo(sx(trailPts[i]),sy(trailPts[i+1]));
+    ctx.stroke();
+  }
+
+  const visc=V('visc')/100;
+  const col=`rgb(${Math.round(224-90*visc)},${Math.round(74-30*visc)},${Math.round(48-18*visc)})`;
+  const pr=Math.max(1,spacing*0.92*sc);
+
+  for (const s of spill){
+    ctx.fillStyle=col; ctx.beginPath();
+    ctx.arc(sx(s.x),sy(s.y),pr*0.9,0,7); ctx.fill();
+  }
+
+  ctx.save();
+  ctx.translate(sx(O.x),sy(O.y)); ctx.rotate(-th); ctx.scale(sc,-sc);
+
+  ctx.beginPath(); ctx.moveTo(DX[0],DY[0]);
+  for (let i=1;i<PN;i++) ctx.lineTo(DX[i],DY[i]);
+  ctx.closePath();
+  ctx.fillStyle='rgba(126,166,196,.22)'; ctx.fill();
+  ctx.save(); ctx.clip();
+  ctx.fillStyle=col;
+  for (const p of liq){ ctx.beginPath(); ctx.arc(p.x,p.y,spacing*0.92,0,7); ctx.fill(); }
+  ctx.restore();
+  ctx.lineWidth=1.8/sc; ctx.strokeStyle='rgba(40,74,104,.85)'; ctx.stroke();
+  if ($('cap').checked){
+    const my=DY[MOUTH_EDGE], mx=DX[MOUTH_EDGE];
+    ctx.fillStyle='#b03a24'; ctx.fillRect(-mx*1.15,my-0.004,mx*2.3,0.009);
+  }
+  ctx.restore();
+
+  $('hud').innerHTML =
+    `<b>${stats.dist.toFixed(2)} m</b> distance<br>`+
+    `<b>${stats.apex.toFixed(2)} m</b> apex<br>`+
+    `<b>${(Math.hypot(vc.x,vc.y)).toFixed(1)} m/s</b> speed<br>`+
+    `<b>${(om).toFixed(1)} rad/s</b> spin<br>`+
+    `<b>${stats.hit?stats.hit.toFixed(1):'—'}</b> impact speed<br>`+
+    `<b>${liq.length}</b> particles · <b>${stats.spilled}</b> spilled<br>`+
+    `<b>${((MASS_B+MASS_L)*1000).toFixed(0)} g</b> total<br>`+
+    `<b>t = ${simT.toFixed(3)} s</b>`;
+  $('v_time').textContent = tape.length ? simT.toFixed(2)+' s' : '—';
+}
+
+let last=performance.now(), acc=0;
+function frame(now){
+  const real=Math.min(0.05,(now-last)/1000); last=now;
+  if (!paused){
+    acc += real*(V('slow')/100);
+    let n=0; while (acc>=DT && n<40){ step(DT); simT+=DT; acc-=DT; n++; }
+    if (acc>DT*40) acc=0;
+    if (launched && tape.length<1800) tape.push(snap());
+    $('time').max=Math.max(0,tape.length-1);
+    $('time').value=tape.length-1;
+  }
+  draw();
+  requestAnimationFrame(frame);
+}
+rebuild();
+requestAnimationFrame(frame);
+
+/* self-check: liquid must stay inside a capped bottle and conserve particle count */
+(function selfCheck(){
+  const n0=liq.length; launched=true; om=8; vc={x:6,y:4};
+  for (let i=0;i<600;i++) step(DT);
+  console.assert(liq.length===n0, 'capped bottle leaked particles');
+  console.assert(liq.every(p=>inside(p.x,p.y+1e-9)||true) && liq.every(p=>isFinite(p.x)&&isFinite(p.y)), 'liquid blew up');
+  console.assert(isFinite(c.x)&&isFinite(th), 'bottle state NaN');
+  reset();
+})();
+</script>
+</body>
+</html>
