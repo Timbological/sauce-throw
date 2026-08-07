@@ -44,7 +44,19 @@
     </select>
   </label>
   <label>Fill <span id="v_fill"></span><input type="range" id="fill" min="0" max="100" value="50" data-u="%"></label>
-  <label>Viscosity <span id="v_visc"></span><input type="range" id="visc" min="0" max="100" value="80" data-u="%"></label>
+  <label>Contents
+    <select id="preset">
+      <option value="water">Water</option>
+      <option value="oil">Olive oil</option>
+      <option value="honey">Honey</option>
+      <option value="sauce" selected>Tomato sauce</option>
+      <option value="ketchup">Thick ketchup</option>
+      <option value="mayo">Mayonnaise</option>
+    </select>
+  </label>
+  <label>Yield stress &tau;<sub>y</sub> <span id="v_ty"></span><input type="range" id="ty" min="0" max="400" value="24" step="1" data-u=" Pa"></label>
+  <label>Consistency K <span id="v_kk"></span><input type="range" id="kk" min="0" max="40" value="15" step="0.1" data-u=" Pa&middot;s&#8319;"></label>
+  <label>Flow index n <span id="v_nn"></span><input type="range" id="nn" min="0.15" max="1" value="0.3" step="0.01" data-u=""></label>
   <label>Bottle mass <span id="v_mass"></span><input type="range" id="mass" min="15" max="400" value="60" data-u=" g"></label>
   <label>Wall flex <span id="v_flex"></span><input type="range" id="flex" min="0" max="100" value="0" data-u="%"></label>
   <div class="chk"><input type="checkbox" id="cap" checked><label for="cap" style="margin:0">Cap on (uncheck to spill)</label></div>
@@ -225,20 +237,81 @@ function forNeighbours(p,fn){
 }
 
 /* ---------- liquid (Clavet et al. 2005, position-based) ---------- */
-function liquidStep(dt, ax, ay, alpha, visc){
-  const sigma = 6+visc*90, beta = 2+visc*60;
+// ---------- Herschel-Bulkley rheology ----------
+// tau = tau_y + K * gamma_dot^n  above the yield stress; below it, no flow at all.
+// Apparent viscosity mu = K*g^(n-1) + tau_y*(1-exp(-m*g))/g  (Papanastasiou regularisation,
+// which keeps mu finite as g -> 0 instead of dividing by zero).
+// Literature Herschel-Bulkley fits. Yield stress is what separates these: honey is far more
+// viscous than ketchup at rest yet has no yield stress, so it always flows, just slowly.
+const PRESETS = {
+  water:   {ty:0,  K:0.001, n:1},
+  oil:     {ty:0,  K:0.08,  n:1},
+  honey:   {ty:0,  K:10,    n:1},
+  sauce:   {ty:24, K:15,    n:0.30},
+  ketchup: {ty:40, K:25,    n:0.28},
+  mayo:    {ty:90, K:30,    n:0.35},
+};
+const RHEO = () => ({ty:V('ty'), K:V('kk'), n:V('nn')});
+const thickness = () => clamp(V('ty')/90*0.6 + V('kk')/30*0.4, 0, 1);   // for colour only
+const RHO_L = 1100;          // kg/m^3, sauce
+const PAPA  = 1000;          // Papanastasiou regularisation constant, s
+function muApparent(g, ty, K, n){
+  const gs = Math.max(g, 1e-6);
+  return K*Math.pow(gs, n-1) + ty*(1-Math.exp(-PAPA*gs))/gs;
+}
+
+function liquidStep(dt, ax, ay, alpha, rheo){
+  const {ty, K, n} = rheo;
   for (const p of liq){
     p.vx += (ax + om*om*p.x + alpha*p.y + 2*om*p.vy)*dt;   // gravity + centrifugal + Euler + Coriolis
     p.vy += (ay + om*om*p.y - alpha*p.x - 2*om*p.vx)*dt;
   }
   grid();
+
+  // 1. shear rate from the SPH velocity gradient, using a normalised 2D kernel so gamma_dot
+  //    comes out in real 1/s and tau_y can be a real number of pascals
+  const A = 1/(0.1*Math.PI*HR*HR), Vp = spacing*spacing*0.866;
+  for (const p of liq){
+    let gxx=0, gxy=0, gyx=0, gyy=0, S=0;
+    forNeighbours(p,(q,dx,dy,d)=>{
+      const qn=d/HR, dW=-A*3*(1-qn)*(1-qn)/HR, wx=dW*dx/d, wy=dW*dy/d;
+      const ux=q.vx-p.vx, uy=q.vy-p.vy;
+      gxx+=Vp*ux*wx; gxy+=Vp*ux*wy; gyx+=Vp*uy*wx; gyy+=Vp*uy*wy;
+      S+=1-qn;
+    });
+    const Dxx=gxx, Dyy=gyy, Dxy=0.5*(gxy+gyx);
+    p.gam = Math.sqrt(2*(Dxx*Dxx + 2*Dxy*Dxy + Dyy*Dyy));
+    p.S = S;
+    // implicit-style blend factor. An explicit viscous term with a yielded mu of ~25 kPa.s
+    // would need a 60 kHz timestep; expressing it as "how far does velocity diffuse in one
+    // step, capped at one smoothing length" is unconditionally stable and tends to plug flow
+    // (zero relative motion = unyielded solid) exactly as mu -> infinity.
+    p.B = 1-Math.exp(-muApparent(p.gam,ty,K,n)*dt/(RHO_L*HR*HR));
+  }
+
+  // 2. viscous exchange, pairwise and momentum-conserving, acting on the FULL relative
+  //    velocity so it damps shear and not just compression
   for (const p of liq) forNeighbours(p,(q,dx,dy,d)=>{
     if (q.x<p.x || (q.x===p.x && q.y<p.y)) return;              // each pair once
-    const ux=dx/d, uy=dy/d, u=(p.vx-q.vx)*ux+(p.vy-q.vy)*uy;
-    if (u<=0) return;
-    let I = clamp(dt*(1-d/HR)*(sigma*u+beta*u*u), 0, u)*0.5;
-    p.vx-=I*ux; p.vy-=I*uy; q.vx+=I*ux; q.vy+=I*uy;
+    const f = clamp((p.B+q.B)*(1-d/HR)/Math.max(p.S,q.S,1e-9), 0, 1);
+    const ex=(q.vx-p.vx)*f*0.5, ey=(q.vy-p.vy)*f*0.5;
+    p.vx+=ex; p.vy+=ey; q.vx-=ex; q.vy-=ey;
   });
+  // 3. Wall boundary, stress-limited. The glass can only transmit tau = tau_y + K*gdot^n before
+  //    the sauce yields against it, so cap the momentum transfer at that stress times this
+  //    particle's share of wall area. A velocity-blend boundary (what I had first) is not
+  //    stress-based and is not resolution-independent — refining the particles changed the
+  //    answer, which means it was not converged physics.
+  const mp = MASS_L/Math.max(liq.length,1), Ap = spacing*DEPTH;
+  if (mp>0) for (const p of liq){
+    if (p.wd===undefined || p.wd>=spacing) continue;
+    const vs=Math.hypot(p.vx,p.vy);
+    if (vs<1e-9) continue;
+    const tau = ty + K*Math.pow(vs/spacing, n);      // shear rate across the wall layer
+    const dv = Math.min(vs, tau*Ap*dt/mp);           // can arrest the layer, never reverse it
+    p.vx-=dv*p.vx/vs; p.vy-=dv*p.vy/vs;
+  }
+
   for (const p of liq){ p.px=p.x; p.py=p.y; p.x+=p.vx*dt; p.y+=p.vy*dt; }
   grid();
   const k=KP, kn=KNP, lim=0.4*HR;
@@ -253,11 +326,8 @@ function liquidStep(dt, ax, ay, alpha, visc){
     });
     p.x+=sx; p.y+=sy;
   }
-  // walls / escape / adhesion
-  const capOn=$('cap').checked, fr=0.15+0.6*visc, cth=Math.cos(th), sth=Math.sin(th);
-  const adh=visc*0.85, adhR=spacing*1.1;   // sauce clings to the glass; water barely does
-  const flexNow=V('flex')/100;
-  let wallCount=0;
+  // walls / escape
+  const capOn=$('cap').checked, cth=Math.cos(th), sth=Math.sin(th);
   for (let i=liq.length-1;i>=0;i--){
     const p=liq[i];
     const out=!inside(p.x,p.y);
@@ -268,6 +338,7 @@ function liquidStep(dt, ax, ay, alpha, visc){
       const qx=ax2+t*ex, qy=ay2+t*ey, dd=(p.x-qx)**2+(p.y-qy)**2;
       if (dd<best){ best=dd; bx=qx; by=qy; bi=e; bt=t; }
     }
+    p.wd = Math.sqrt(best);          // cached for the next sub-step's no-slip term
     if (out){
       if (!capOn && bi===MOUTH_EDGE){                 // out of the neck
         liq.splice(i,1); stats.spilled++;
@@ -278,47 +349,12 @@ function liquidStep(dt, ax, ay, alpha, visc){
           vy:vOy+sth*vx+cth*vy+om*(cth*p.x-sth*p.y)});
         continue;
       }
-      // ponytail: no reaction force back onto the wall. Tried it; every wall particle nudging
-      // its edge outward every sub-step inflated the bottle and pinned it there. The coupling
-      // that matters is one-way anyway — the wall caves in, the containment carries the sauce
-      // with it, and the sauce leaves through the neck.
-      p.x=bx; p.y=by;
-      p.px += fr*(p.x-p.px); p.py += fr*(p.y-p.py);   // ponytail: crude no-slip, scales with viscosity
-    } else if (adh>0 && best < adhR*adhR){
-      wallCount++;
-      // adhesion: drag the wall layer toward rest in the bottle's frame. This is what actually
-      // holds thick sauce up in an upturned bottle — internal stiffness alone just falls out.
-      p.px += adh*(p.x-p.px); p.py += adh*(p.y-p.py);
+      p.x=bx; p.y=by; p.wd=0;
     }
   }
   for (const p of liq){
     p.vx=clamp((p.x-p.px)/dt,-40,40);
     p.vy=clamp((p.y-p.py)/dt,-40,40);
-  }
-  // Yield stress. Viscous damping alone can only ever make the sauce flow *slowly* — thick
-  // honey still drains out of an upturned bottle. Real sauce holds its shape until something
-  // stresses it enough. Cheap stand-in: blend the slug's velocities toward the rigid-body
-  // motion of the whole mass (mean velocity + the rotation matching its angular momentum).
-  // At full blend the sauce cannot deform at all and rides in the bottle as a solid plug.
-  // ponytail: global, so two separated blobs would rigidly couple. Per-blob would need
-  // connected-component labelling — do that if anyone cares about a split slug.
-  const rig = Math.max(0, (visc-0.45)/0.55)**2;
-  if (rig>0 && liq.length>2){
-    let cx=0, cy=0, vx=0, vy=0;
-    for (const p of liq){ cx+=p.x; cy+=p.y; vx+=p.vx; vy+=p.vy; }
-    const n=liq.length; cx/=n; cy/=n; vx/=n; vy/=n;
-    let L=0, I=0;
-    for (const p of liq){ const rx=p.x-cx, ry=p.y-cy;
-      L += rx*(p.vy-vy) - ry*(p.vx-vx); I += rx*rx+ry*ry; }
-    let w = I>1e-9 ? L/I : 0;
-    // The yield criterion. Stuck to the glass and stressed below yield, the slug does not move
-    // at all — that is what separates sauce from merely thick liquid, and gravity alone (0.014
-    // m/s per sub-step) never reaches it. An impact does, so a good whack still shifts it.
-    const yieldV = visc*0.35;
-    if (wallCount>0 && Math.hypot(vx,vy) < yieldV && Math.abs(w)*0.05 < yieldV){ vx=0; vy=0; w=0; }
-    for (const p of liq){ const rx=p.x-cx, ry=p.y-cy;
-      p.vx += rig*((vx - w*ry) - p.vx);
-      p.vy += rig*((vy + w*rx) - p.vy); }
   }
 }
 
@@ -334,7 +370,7 @@ function comLocal(){
 }
 
 function step(dt){
-  const g=V('grav'), visc=V('visc')/100, flex=V('flex')/100;
+  const g=V('grav'), flex=V('flex')/100, rheo=RHEO();
   comLocal();
   if (comLock){ comLx=comLock.x; comLy=comLock.y; }   // asleep: liquid drift must not walk the bottle
   let touching=false;
@@ -450,11 +486,11 @@ function step(dt){
   const dx=0-aOx, dy=-g-aOy;
   shellStep(dt, flex);
   const lax=ct2*dx+st2*dy, lay=-st2*dx+ct2*dy;
-  for (let i=0;i<LSUB;i++) liquidStep(dt/LSUB, lax, lay, alpha, visc);
+  for (let i=0;i<LSUB;i++) liquidStep(dt/LSUB, lax, lay, alpha, rheo);
 
   for (const s of spill){
     s.vy -= g*dt; s.x += s.vx*dt; s.y += s.vy*dt;
-    if (s.y < 0.002){ s.y=0.002; s.vy*=-0.15; s.vx*=0.75-0.5*visc; }
+    if (s.y < 0.002){ s.y=0.002; s.vy*=-0.15; s.vx*=0.75-0.5*thickness(); }
   }
   if (launched){
     stats.apex = Math.max(stats.apex, O.y);
@@ -527,6 +563,11 @@ document.querySelectorAll('input[type=range]:not(#time)').forEach(el=>{
   const upd=()=>out.textContent=(+el.value).toFixed(el.step&&el.step<1?2:0)+u;
   el.addEventListener('input',upd); upd();
 });
+$('preset').addEventListener('input',()=>{
+  const r=PRESETS[$('preset').value];
+  $('ty').value=r.ty; $('kk').value=r.K; $('nn').value=r.n;
+  ['ty','kk','nn'].forEach(id=>$(id).dispatchEvent(new Event('input')));
+});
 ['shape','fill'].forEach(id=>$(id).addEventListener('input',rebuild));
 ['mass','hgt','tilt'].forEach(id=>$(id).addEventListener('input',()=>{ if(!launched) place(); }));
 $('time').addEventListener('input',()=>seek(V('time')));
@@ -583,7 +624,7 @@ function draw(){
     ctx.stroke();
   }
 
-  const visc=V('visc')/100;
+  const visc=thickness();
   const col=`rgb(${Math.round(224-90*visc)},${Math.round(74-30*visc)},${Math.round(48-18*visc)})`;
   const pr=Math.max(1,spacing*0.92*sc);
 
